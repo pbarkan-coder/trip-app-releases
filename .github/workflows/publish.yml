@@ -1,0 +1,66 @@
+name: Publish APKs
+
+# Claude pushes signed APKs into incoming/. This publishes each one as a release, then rewrites
+# main to a single clean commit so the APK files do not pile up in the repository's history.
+#   TripApp-1.0.<n>.apk      -> v1.0.<n>         (Barkan Travel, marked "latest")
+#   BarkanFindMe-1.0.<n>.apk -> findme-v1.0.<n>  (Barkan Find me, never "latest")
+on:
+  push:
+    branches: [main]
+    paths: ["incoming/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Take the APKs out of the repository
+        run: |
+          mkdir -p "$RUNNER_TEMP/apk"
+          shopt -s nullglob
+          for f in incoming/*.apk; do mv "$f" "$RUNNER_TEMP/apk/"; done
+          ls -la "$RUNNER_TEMP/apk"
+
+      - name: Rewrite main without them
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git checkout --orphan clean
+          git rm -rq --cached incoming 2>/dev/null || true
+          rm -rf incoming
+          git add -A
+          git commit -qm "Releases repo"
+          git push -f origin clean:main
+          echo "SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Publish releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          shopt -s nullglob
+          for f in "$RUNNER_TEMP"/apk/*.apk; do
+            name=$(basename "$f")
+            size=$(stat -c %s "$f")
+            if [ "$size" -lt 1000000 ] || ! unzip -tq "$f" >/dev/null 2>&1 || ! grep -q "APK Sig Block 42" "$f"; then
+              echo "::error::$name is not a signed APK ($size bytes): not published"; continue
+            fi
+            if [[ "$name" =~ ^TripApp-1\.0\.([0-9]+)\.apk$ ]]; then
+              tag="v1.0.${BASH_REMATCH[1]}"; title="Barkan Travel 1.0.${BASH_REMATCH[1]}"; latest=true
+            elif [[ "$name" =~ ^BarkanFindMe-1\.0\.([0-9]+)\.apk$ ]]; then
+              tag="findme-v1.0.${BASH_REMATCH[1]}"; title="Barkan Find me 1.0.${BASH_REMATCH[1]}"; latest=false
+            else
+              echo "::warning::skipping $name (unknown name)"; continue
+            fi
+            if gh release view "$tag" >/dev/null 2>&1; then echo "::notice::$tag already published"; continue; fi
+            gh release create "$tag" "$f" --target "$SHA" --title "$title" --notes "" --latest=$latest
+            echo "::notice::published $tag"
+          done
